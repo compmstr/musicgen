@@ -21,6 +21,19 @@
     (.getFile url)
     name))
 
+
+(defn- event-process-key
+  "Add readable note/octave/note-name to note event"
+  [event]
+  (let [key (:key event)
+        note (mod key 12)
+        octave (dec (quot key 12))
+        note-name (note-names note)]
+    (assoc event
+      :note note
+      :octave octave
+      :note-name note-name)))
+
 (defn parse-track-event
   [event]
   (let [tick (.getTick event)
@@ -28,16 +41,13 @@
     (if (instance? ShortMessage msg)
       (case (midi-cmd (.getCommand msg))
         (:note-on :note-off)
-        (let [msg-key (.getData1 msg)
-              note (mod msg-key 12)]
-          {:cmd (midi-cmd (.getCommand msg))
-           :channel (.getChannel msg)
-           :key msg-key
-           :octave (dec (quot msg-key 12))
-           :note note
-           :tick tick
-           :note-name (note-names note)
-           :velocity (.getData2 msg)})
+        (let [msg-key (.getData1 msg)]
+          (event-process-key
+            {:cmd (midi-cmd (.getCommand msg))
+             :channel (.getChannel msg)
+             :key msg-key
+             :tick tick
+             :velocity (.getData2 msg)}))
         {:cmd (.getCommand msg)})
       :non-sm)))
 (defn parse-track
@@ -77,3 +87,56 @@
   (println "Track ticks:" (:ticks track))
   (doseq [evt (track-note-events track)]
     (print-note-event evt)))
+
+(defn- remove-event
+  "Remove an event from a list/vector
+   returns [event-removed updated-list]"
+  [events channel key]
+  (loop [events (apply list events)
+         checked '()]
+    (if (empty? events)
+      [nil (reverse checked)]
+      (let [cur-evt (first events)]
+        (if (and (= key (:key cur-evt))
+                 (= channel (:channel cur-evt)))
+          [cur-evt (concat (reverse checked) (rest events))]
+          (recur (rest events)
+                 (conj checked cur-evt)))))))
+(defn- add-event
+  [events on off]
+  ;;TODO
+  events)
+(defn track->events
+  "Generate a list of {:tick :channel :key :velocity :duration} entries for each channel on this track"
+  [track]
+  (loop [raw-events (track-note-events track)
+         events []
+         started []]
+    (if (empty? raw-events)
+      events
+      (let [cur-event (first raw-events)
+            cur-key (:key cur-event)
+            cur-channel (:channel cur-event)]
+        (case (:cmd cur-event)
+          :note-on
+          (recur (rest raw-events)
+                 events
+                 (conj started cur-event))
+          :note-off
+          (let [[on-event new-started]
+                (remove-event started (:channel cur-event) (:key cur-event))]
+            (recur (rest raw-events)
+                         (add-event events on-event cur-event)
+                         new-started))
+          (do
+            (println "Invalid cmd")
+            (recur (rest raw-events)
+                   events
+                   started)))))))
+  
+
+(comment
+
+  (def tmp (parse-midi "midi/fur_elise.mid"))
+
+)
