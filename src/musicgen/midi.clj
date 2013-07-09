@@ -21,6 +21,10 @@
     (.getFile url)
     name))
 
+(defn midi-file-sequence
+  [filename]
+  (MidiSystem/getSequence (File. (midi-filename filename))))
+
 
 (defn- event-process-key
   "Add readable note/octave/note-name to note event"
@@ -61,7 +65,7 @@
 
 (defn parse-midi
   [filename]
-  (let [midi-seq (MidiSystem/getSequence (File. (midi-filename filename)))]
+  (let [midi-seq (midi-file-sequence filename)]
      {:tracks
       (doall
        (map-indexed parse-track (seq (.getTracks midi-seq))))}))
@@ -134,9 +138,119 @@
                    events
                    started)))))))
   
+(defn- stop-sequencer
+  [sequencer]
+  (doto sequencer
+    (.stop)
+    (.close)))
+(defn play-midi-file
+  ([filename]
+     (play-midi-file filename 5000))
+  ([filename time]
+     (let [sequence (midi-file-sequence filename)
+           sequencer (MidiSystem/getSequencer)]
+       (doto sequencer
+         (.setSequence sequence)
+         (.open)
+         (.start))
+       (.start
+        (Thread. 
+         (fn []
+           (Thread/sleep time)
+           (stop-sequencer sequencer)))))))
+
+(defn short-message
+  [cmd channel note vel]
+  (ShortMessage. cmd channel note vel))
+
+(defn new-player
+  []
+  (let [synth (MidiSystem/getSynthesizer)
+        recv (.getReceiver synth)]
+    {:synth synth
+     :recv recv
+     :event-queue []}))
+(defn open-player
+  [{synth :synth :as player}]
+  (.open synth)
+  (-> player
+      (assoc :start (System/currentTimeMillis))
+      (assoc :event-queue [])))
+(defn close-player
+  [{synth :synth :as player}]
+  (.close synth)
+  nil) ;;clear out player
+
+(defn- note-on-msg
+  [{:keys [channel note vel]}]
+  (short-message ShortMessage/NOTE_ON channel note vel))
+(defn- note-off-msg
+  [{:keys [channel note vel]}]
+  (short-message ShortMessage/NOTE_OFF channel note vel))
+
+(defn stop-note
+  [{:keys [recv] :as player} note-info]
+  (.send recv (note-off-msg note-info) -1))
+
+(defn- note-off-event
+  [note-info after]
+  {:action stop-note
+   :data note-info
+   :at (+ after (System/currentTimeMillis))})
+
+(defn play-note
+  [{:keys [recv event-queue] :as player} {:keys [duration] :as note-info}]
+  (let [on-msg (note-on-msg note-info)]
+    (.send recv on-msg -1)
+    (update-in player [:event-queue] conj (note-off-event note-info duration))))
+
+(defn player-events
+  [{:keys [event-queue recv] :as player}]
+   (let [cur-time (System/currentTimeMillis)
+         {cur-events true other-events false} (group-by #(< (:at %) cur-time) event-queue)]
+     (doseq [{:keys [action data]} cur-events]
+       (action player data))
+     (assoc player :event-queue other-events)))
+
+(defn play-note-old
+  [note vel duration]
+  (let [sm (short-message ShortMessage/NOTE_ON 0 note vel)
+        em (short-message ShortMessage/NOTE_OFF 0 note vel)
+        synth (MidiSystem/getSynthesizer)
+        recv (.getReceiver synth)]
+    (.open synth)
+    (.send recv sm -1) ;;-1 means no time stamp
+    (Thread/sleep duration)
+    (.send recv em -1)
+    (.close synth)))
+
+(defn gen-note-info
+  [channel note vel duration]
+  {:channel channel
+   :note note
+   :vel vel
+   :duration duration})
+(def test-note
+  (gen-note-info 0 60 90 1000))
+(defn play-single-note
+  [note-info]
+  (let [player (atom (new-player))]
+    (swap! player open-player)
+    (swap! player play-note note-info)
+    (while (not (empty? (:event-queue @player)))
+      (Thread/sleep 1)
+      (swap! player player-events))
+    (swap! player close-player)))
 
 (comment
 
   (def tmp (parse-midi "midi/fur_elise.mid"))
+  
+  (def player (atom (new-player)))
+  (swap! player open-player)
+  (swap! player play-note {:note 60 :duration 1000 :channel 0 :vel 90})
+  (while (not (empty? (:event-queue @player)))
+    (swap! player player-events))
+  (swap! player close-player)
 
 )
