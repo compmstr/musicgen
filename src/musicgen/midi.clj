@@ -25,18 +25,52 @@
   [filename]
   (MidiSystem/getSequence (File. (midi-filename filename))))
 
+(defn note-desc->note-info
+  [desc]
+  (let [[note octave] (rest (re-matches #"([a-gA-G]#?)([0-9]+)" desc))
+        octave (try (Integer/valueOf octave)
+                    (catch NumberFormatException e
+                      (println "Invalid note description")
+                      nil))]
+    (if (or (nil? note) (nil? octave))
+      nil
+      (let [note (.toUpperCase note)]
+        {:note-name (keyword note)
+         :octave octave}))))
+
+(defn note-info->key
+  [{:keys [note octave note-name] :as note-info}]
+  (let [note (or note
+                 (loop [i 0]
+                   (if (< i (count note-names))
+                     (if (= (.toUpperCase
+                             (if (keyword? note-name)
+                               (name note-name)
+                               (str note-name)))
+                            (name (nth note-names i)))
+                       i
+                       (recur (inc i)))
+                     nil)))]
+    (if (or (nil? note)
+            (nil? octave))
+      nil
+      (+ (* (inc octave) 12) note))))
+
+(defn key->note-info
+  [key]
+  (let [note (mod key 12)
+        octave (dec (quot key 12))
+        note-name (note-names note)]
+    {:note note :octave octave :note-name note-name}))
+
+(defn note-desc->key
+  [desc]
+  (note-info->key (note-desc->note-info desc)))
 
 (defn- event-process-key
   "Add readable note/octave/note-name to note event"
   [event]
-  (let [key (:key event)
-        note (mod key 12)
-        octave (dec (quot key 12))
-        note-name (note-names note)]
-    (assoc event
-      :note note
-      :octave octave
-      :note-name note-name)))
+  (merge event (key->note-info (:key event))))
 
 (defn parse-track-event
   [event]
@@ -137,31 +171,41 @@
             (recur (rest raw-events)
                    events
                    started)))))))
+
+;;----------PLAYBACK------------
   
-(defn- stop-sequencer
-  [sequencer]
-  (doto sequencer
-    (.stop)
-    (.close)))
-(defn play-midi-file
-  ([filename]
-     (play-midi-file filename 5000))
-  ([filename time]
-     (let [sequence (midi-file-sequence filename)
-           sequencer (MidiSystem/getSequencer)]
-       (doto sequencer
-         (.setSequence sequence)
-         (.open)
-         (.start))
-       (.start
-        (Thread. 
-         (fn []
-           (Thread/sleep time)
-           (stop-sequencer sequencer)))))))
+(let [stop-sequencer (fn stop-sequencer
+                       [sequencer]
+                       (doto sequencer
+                         (.stop)
+                         (.close)))]
+  (defn play-midi-file
+    ([filename]
+       (play-midi-file filename 5000))
+    ([filename time]
+       (let [sequence (midi-file-sequence filename)
+             sequencer (MidiSystem/getSequencer)]
+         (doto sequencer
+           (.setSequence sequence)
+           (.open)
+           (.start))
+         (.start
+          (Thread. 
+           (fn []
+             (Thread/sleep time)
+             (stop-sequencer sequencer))))))))
 
 (defn short-message
   [cmd channel note vel]
   (ShortMessage. cmd channel note vel))
+
+(defn player-events
+  [{:keys [event-queue recv] :as player}]
+   (let [cur-time (System/currentTimeMillis)
+         {cur-events true other-events false} (group-by #(< (:at %) cur-time) event-queue)]
+     (doseq [{:keys [action data]} cur-events]
+       (action player data))
+     (assoc player :event-queue other-events)))
 
 (defn new-player
   []
@@ -170,23 +214,42 @@
     {:synth synth
      :recv recv
      :event-queue []}))
+
+(let [player-event-thread-fn
+      (fn player-event-thread-fn
+        [player]
+        (fn []
+          (try
+            (while true
+              (swap! player player-events)
+              (Thread/sleep 1))
+            (catch InterruptedException e
+              (println "Ending player event thread")))))]
+
+  (defn add-player-event-thread!
+    "Take in a player atom, and start an event thread for it"
+    [player-atom]
+    (let [event-thread (Thread. (player-event-thread-fn player-atom))]
+      (.start event-thread)
+      (swap! player-atom assoc :event-thread event-thread))))
 (defn open-player
   [{synth :synth :as player}]
   (.open synth)
-  (-> player
-      (assoc :start (System/currentTimeMillis))
-      (assoc :event-queue [])))
+    (-> player
+        (assoc :start (System/currentTimeMillis))
+        (assoc :event-queue [])))
 (defn close-player
-  [{synth :synth :as player}]
+  [{:keys [synth event-thread] :as player}]
+  (.interrupt event-thread)
   (.close synth)
   nil) ;;clear out player
 
 (defn- note-on-msg
-  [{:keys [channel note vel]}]
-  (short-message ShortMessage/NOTE_ON channel note vel))
+  [{:keys [channel key vel]}]
+  (short-message ShortMessage/NOTE_ON channel key vel))
 (defn- note-off-msg
-  [{:keys [channel note vel]}]
-  (short-message ShortMessage/NOTE_OFF channel note vel))
+  [{:keys [channel key vel]}]
+  (short-message ShortMessage/NOTE_OFF channel key vel))
 
 (defn stop-note
   [{:keys [recv] :as player} note-info]
@@ -198,19 +261,27 @@
    :data note-info
    :at (+ after (System/currentTimeMillis))})
 
+(defn- remove-note-events
+  "Remove any events associated with the provided note-info"
+  [event-queue {:keys [channel key vel]}]
+  (remove (fn [{{cur-channel :channel
+                 cur-key :key
+                 cur-vel :vel} :data}]
+            (and (= cur-channel channel)
+                 (= cur-key key)
+                 (= cur-vel vel)))
+          event-queue))
+
 (defn play-note
   [{:keys [recv event-queue] :as player} {:keys [duration] :as note-info}]
   (let [on-msg (note-on-msg note-info)]
+    (stop-note player note-info)
     (.send recv on-msg -1)
-    (update-in player [:event-queue] conj (note-off-event note-info duration))))
-
-(defn player-events
-  [{:keys [event-queue recv] :as player}]
-   (let [cur-time (System/currentTimeMillis)
-         {cur-events true other-events false} (group-by #(< (:at %) cur-time) event-queue)]
-     (doseq [{:keys [action data]} cur-events]
-       (action player data))
-     (assoc player :event-queue other-events)))
+    (-> player
+        ;;Remove any existing stop events for this note
+        (update-in [:event-queue] remove-note-events note-info)
+        ;;Add the new stop event
+        (update-in [:event-queue] conj (note-off-event note-info duration)))))
 
 (defn play-note-old
   [note vel duration]
@@ -225,13 +296,36 @@
     (.close synth)))
 
 (defn gen-note-info
-  [channel note vel duration]
+  [channel key vel duration]
   {:channel channel
-   :note note
+   :key key
    :vel vel
    :duration duration})
 (def test-note
   (gen-note-info 0 60 90 1000))
+(def test-notes
+  (map #(gen-note-info 0 % 90 500)
+       (range 55 65 2)))
+(def test-notes2
+  (map #(gen-note-info 0 % 90 250)
+       (range 54 65 2)))
+(defn play-notes-in-bg
+  "Play notes in the bg, either specifying the delay between notes or
+   playing one after the next"
+  ([player notes delay]
+     (.start
+      (Thread.
+       (fn []
+         (doseq [n notes]
+           (swap! player play-note n)
+           (Thread/sleep delay))))))
+  ([player notes]
+     (.start
+      (Thread.
+       (fn []
+         (doseq [{:keys [duration] :as n} notes]
+           (swap! player play-note n)
+           (Thread/sleep duration)))))))
 (defn play-single-note
   [note-info]
   (let [player (atom (new-player))]
@@ -248,9 +342,20 @@
   
   (def player (atom (new-player)))
   (swap! player open-player)
-  (swap! player play-note {:note 60 :duration 1000 :channel 0 :vel 90})
-  (while (not (empty? (:event-queue @player)))
-    (swap! player player-events))
+  (add-player-event-thread! player)
+  (swap! player play-note {:key 60 :duration 1000 :channel 0 :vel 90})
+  (swap! player play-note (gen-note-info 0 (note-desc->key "c4") 90 1000))
+  (doseq [n test-notes] (swap! player play-note n) (Thread/sleep 250))
   (swap! player close-player)
+
+  ;;Play lion sleeps tonight
+  (play-notes-in-bg 
+   player 
+   (map (comp 
+         #(gen-note-info 0 % 90 250)
+         note-desc->key) 
+        ["c4" "d4" "e4" "d4" "e4" "f4" "e4"
+         "d4" "c4" "d4" "e4" "d4" "c4" "e4" "d4"])
+   250)
 
 )
