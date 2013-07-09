@@ -85,7 +85,7 @@
              :channel (.getChannel msg)
              :key msg-key
              :tick tick
-             :velocity (.getData2 msg)}))
+             :vel (.getData2 msg)}))
         {:cmd (.getCommand msg)})
       :non-sm)))
 (defn parse-track
@@ -118,7 +118,7 @@
                    (:note-name evt)
                    (:octave evt)
                    (:key evt)
-                   (:velocity evt))))
+                   (:vel evt))))
 
 (defn print-track
   [track]
@@ -142,10 +142,17 @@
                  (conj checked cur-evt)))))))
 (defn- add-event
   [events on off]
-  ;;TODO
-  events)
+  (let [on-tick (:tick on)
+        off-tick (:tick off)
+        duration (- off-tick on-tick)
+        event {:tick on-tick
+               :duration duration
+               :channel (:channel on)
+               :key (:key on)
+               :vel (:vel on)}]
+    (conj events event)))
 (defn track->events
-  "Generate a list of {:tick :channel :key :velocity :duration} entries for each channel on this track"
+  "Generate a list of {:tick :channel :key :vel :duration} entries for each channel on this track"
   [track]
   (loop [raw-events (track-note-events track)
          events []
@@ -240,8 +247,10 @@
         (assoc :event-queue [])))
 (defn close-player
   [{:keys [synth event-thread] :as player}]
-  (.interrupt event-thread)
-  (.close synth)
+  (when event-thread
+    (.interrupt event-thread))
+  (when (and synth (.isOpen synth))
+    (.close synth))
   nil) ;;clear out player
 
 (defn- note-on-msg
@@ -250,6 +259,10 @@
 (defn- note-off-msg
   [{:keys [channel key vel]}]
   (short-message ShortMessage/NOTE_OFF channel key vel))
+
+(defn start-note
+  [{:keys [recv] :as player} note-info]
+  (.send recv (note-on-msg note-info) -1))
 
 (defn stop-note
   [{:keys [recv] :as player} note-info]
@@ -272,16 +285,24 @@
                  (= cur-vel vel)))
           event-queue))
 
+(declare play-note)
+(defn play-note-later-event
+  [{:keys [at] :as note-info}]
+  {:at at :action play-note :data note-info})
+(defn play-note-later
+  "Sets up a note-info with an :at key to play when :at is reached"
+  [{:keys [recv event-queue] :as player} note-info]
+  (update-in  player [:event-queue] conj (play-note-later-event note-info)))
+
 (defn play-note
   [{:keys [recv event-queue] :as player} {:keys [duration] :as note-info}]
-  (let [on-msg (note-on-msg note-info)]
-    (stop-note player note-info)
-    (.send recv on-msg -1)
-    (-> player
-        ;;Remove any existing stop events for this note
-        (update-in [:event-queue] remove-note-events note-info)
-        ;;Add the new stop event
-        (update-in [:event-queue] conj (note-off-event note-info duration)))))
+  (stop-note player note-info)
+  (start-note player note-info)
+  (-> player
+      ;;Remove any existing stop events for this note
+      (update-in [:event-queue] remove-note-events note-info)
+      ;;Add the new stop event
+      (update-in [:event-queue] conj (note-off-event note-info duration))))
 
 (defn play-note-old
   [note vel duration]
@@ -309,6 +330,36 @@
 (def test-notes2
   (map #(gen-note-info 0 % 90 250)
        (range 54 65 2)))
+
+(defn convert-ticks-to-ms
+  "Converts :tick in events into :at time references"
+  ([events tick-ms]
+     (convert-ticks-to-ms events tick-ms (System/currentTimeMillis)))
+  ([events tick-ms start-time]
+     (map #(assoc % :at
+                  (+ start-time (* tick-ms (:tick %))))
+          events)))
+
+(defn bpm->ticks-per-ms
+  [bpm]
+  (int (/ 60000 (* 96 bpm)))) ;;96 ticks per beat
+  
+(defn play-track-events-in-bg
+  "Plays a set of events (uses track->events)"
+  [player track {:keys [bpm]}]
+  (let [events (map play-note-later-event
+                    (convert-ticks-to-ms (track->events track) (bpm->ticks-per-ms bpm)))]
+    (update-in player [:event-queue] concat events)))
+
+(defn play-parsed-midi
+  [player parsed bpm]
+  (loop [player player
+         tracks (:tracks parsed)]
+    (if (empty? tracks)
+      player
+      (recur (play-track-events-in-bg player (first tracks) {:bpm bpm})
+             (rest tracks)))))
+
 (defn play-notes-in-bg
   "Play notes in the bg, either specifying the delay between notes or
    playing one after the next"
@@ -326,6 +377,7 @@
          (doseq [{:keys [duration] :as n} notes]
            (swap! player play-note n)
            (Thread/sleep duration)))))))
+
 (defn play-single-note
   [note-info]
   (let [player (atom (new-player))]
@@ -336,19 +388,9 @@
       (swap! player player-events))
     (swap! player close-player)))
 
-(comment
-
-  (def tmp (parse-midi "midi/fur_elise.mid"))
-  
-  (def player (atom (new-player)))
-  (swap! player open-player)
-  (add-player-event-thread! player)
-  (swap! player play-note {:key 60 :duration 1000 :channel 0 :vel 90})
-  (swap! player play-note (gen-note-info 0 (note-desc->key "c4") 90 1000))
-  (doseq [n test-notes] (swap! player play-note n) (Thread/sleep 250))
-  (swap! player close-player)
-
-  ;;Play lion sleeps tonight
+(defn song-test
+  "Play lion sleeps tonight"
+  [player]
   (play-notes-in-bg 
    player 
    (map (comp 
@@ -356,6 +398,28 @@
          note-desc->key) 
         ["c4" "d4" "e4" "d4" "e4" "f4" "e4"
          "d4" "c4" "d4" "e4" "d4" "c4" "e4" "d4"])
-   250)
+   250))
+
+(defn restart-a-player
+  [player]
+  (swap! player close-player)
+  (reset! player (new-player))
+  (swap! player open-player)
+  (add-player-event-thread! player))
+
+(comment
+
+  (def tmp (parse-midi "midi/fur_elise.mid"))
+  
+  (def player (atom (new-player)))
+  (swap! player open-player)
+  (add-player-event-thread! player)
+  (swap! player play-parsed-midi tmp 200)
+
+  (swap! player play-note {:key 60 :duration 1000 :channel 0 :vel 90})
+  (swap! player play-note (gen-note-info 0 (note-desc->key "c4") 90 1000))
+  (doseq [n test-notes] (swap! player play-note n) (Thread/sleep 250))
+  (swap! player close-player)
+
 
 )
