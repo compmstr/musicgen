@@ -466,7 +466,7 @@
          "d4" "c4" "d4" "e4" "d4" "c4" "e4" "d4"])
    250))
 
-(defn restart-a-player
+(defn restart-a-player!
   [player]
   (swap! player close-player)
   (reset! player (new-player))
@@ -482,13 +482,19 @@
            num 0]
       (when (< num n)
         (let [duration-ms (* ticks-per-ms duration)]
-          (swap! player play-note (gen-note-info 0 key vel duration-ms))
+          (swap! player-atom play-note (gen-note-info 0 key vel duration-ms))
           (Thread/sleep duration-ms)
           (recur
            (weighted-rand ((:keys chain) key))
            (weighted-rand ((:durations chain) duration))
            (weighted-rand ((:velocities chain) vel))
            (inc num)))))))
+
+(defn play-chain-from-file!
+  [player-atom file track bpm n]
+  (let [mid (parse-midi file)
+        chains (map events->chain (:tracks tmp))]
+    (play-chain! player-atom (nth chains track) bpm n)))
 
 (comment
 
