@@ -253,20 +253,19 @@
                          (.stop)
                          (.close)))]
   (defn play-midi-file
-    ([filename]
-       (play-midi-file filename 5000))
-    ([filename time]
-       (let [sequence (midi-file-sequence filename)
-             sequencer (MidiSystem/getSequencer)]
-         (doto sequencer
-           (.setSequence sequence)
-           (.open)
-           (.start))
-         (.start
-          (Thread. 
-           (fn []
-             (Thread/sleep time)
-             (stop-sequencer sequencer))))))))
+    [filename & [time]]
+    (let [sequence (midi-file-sequence filename)
+          sequencer (MidiSystem/getSequencer)]
+      (doto sequencer
+        (.setSequence sequence)
+        (.open)
+        (.start))
+      (if time
+        (.start
+         (Thread. 
+          (fn []
+            (Thread/sleep time)
+            (stop-sequencer sequencer))))))))
 
 (defn short-message
   [cmd channel note vel]
@@ -493,7 +492,7 @@
 (defn play-chain-from-file!
   [player-atom file track bpm n]
   (let [mid (parse-midi file)
-        chains (map events->chain (:tracks tmp))]
+        chains (map events->chain (:tracks mid))]
     (play-chain! player-atom (nth chains track) bpm n)))
 
 (comment
@@ -502,7 +501,7 @@
   (def chains (map events->chain) (:tracks tmp))
   
   (def player (atom nil))
-  (swap! player restart-a-player)
+  (restart-a-player! player)
   
   ;;play 20 notes at 250 bpm based on the second track
   (play-chain! player (nth chains 1) 250 20)
