@@ -72,59 +72,10 @@
   [event]
   (merge event (key->note-info (:key event))))
 
-(defn parse-track-event
-  [event]
-  (let [tick (.getTick event)
-        msg (.getMessage event)]
-    (if (instance? ShortMessage msg)
-      (case (midi-cmd (.getCommand msg))
-        (:note-on :note-off)
-        (let [msg-key (.getData1 msg)]
-          (event-process-key
-            {:cmd (midi-cmd (.getCommand msg))
-             :channel (.getChannel msg)
-             :key msg-key
-             :tick tick
-             :vel (.getData2 msg)}))
-        {:cmd (.getCommand msg)})
-      :non-sm)))
-(defn parse-track
-  [idx track]
-  (println "Parsing Track" idx)
-  {:index idx
-   :ticks (.ticks track)
-   :events (doall 
-            (for [i (range (.size track))]
-             (parse-track-event (.get track i))))})
-
-(defn parse-midi
-  [filename]
-  (let [midi-seq (midi-file-sequence filename)]
-     {:tracks
-      (doall
-       (map-indexed parse-track (seq (.getTracks midi-seq))))}))
-
 (defn track-note-events
   [track]
   (filter #(let [cmd (:cmd %)] (or (= cmd :note-on) (= cmd :note-off)))
           (filter :cmd (:events track))))
-
-(defn print-note-event
-  [evt]
-  (println (format "@%d Channel: %d %s, %s octave=%d key=%s vel: %d"
-                   (:tick evt)
-                   (:channel evt)
-                   (:cmd evt)
-                   (:note-name evt)
-                   (:octave evt)
-                   (:key evt)
-                   (:vel evt))))
-
-(defn print-track
-  [track]
-  (println "Track ticks:" (:ticks track))
-  (doseq [evt (track-note-events track)]
-    (print-note-event evt)))
 
 (defn- remove-event
   "Remove an event from a list/vector
@@ -151,6 +102,25 @@
                :key (:key on)
                :vel (:vel on)}]
     (conj events event)))
+
+
+(defn parse-track-event
+  [event]
+  (let [tick (.getTick event)
+        msg (.getMessage event)]
+    (if (instance? ShortMessage msg)
+      (case (midi-cmd (.getCommand msg))
+        (:note-on :note-off)
+        (let [msg-key (.getData1 msg)]
+          (event-process-key
+            {:cmd (midi-cmd (.getCommand msg))
+             :channel (.getChannel msg)
+             :key msg-key
+             :tick tick
+             :vel (.getData2 msg)}))
+        {:cmd (.getCommand msg)})
+      :non-sm)))
+
 (defn track->events
   "Generate a list of {:tick :channel :key :vel :duration} entries for each channel on this track"
   [track]
@@ -178,6 +148,41 @@
             (recur (rest raw-events)
                    events
                    started)))))))
+
+(defn parse-track
+  [idx track]
+  (println "Parsing Track" idx)
+  (track->events
+   {:index idx
+    :ticks (.ticks track)
+    :events (doall 
+             (for [i (range (.size track))]
+               (parse-track-event (.get track i))))}))
+
+(defn parse-midi
+  [filename]
+  (let [midi-seq (midi-file-sequence filename)]
+     {:tracks
+      (doall
+       (map-indexed parse-track (seq (.getTracks midi-seq))))}))
+
+(defn print-note-event
+  [evt]
+  (println (format "@%d Channel: %d %s, %s octave=%d key=%s vel: %d"
+                   (:tick evt)
+                   (:channel evt)
+                   (:cmd evt)
+                   (:note-name evt)
+                   (:octave evt)
+                   (:key evt)
+                   (:vel evt))))
+
+
+(defn print-track
+  [track]
+  (println "Track ticks:" (:ticks track))
+  (doseq [evt (track-note-events track)]
+    (print-note-event evt)))
 
 (defn inc-or-one
   [x]
@@ -392,10 +397,10 @@
   (map #(gen-note-info 0 % 90 250)
        (range 54 65 2)))
 
-(defn convert-ticks-to-ms
+(defn convert-ticks-to-at
   "Converts :tick in events into :at time references"
   ([events tick-ms]
-     (convert-ticks-to-ms events tick-ms (System/currentTimeMillis)))
+     (convert-ticks-to-at events tick-ms (System/currentTimeMillis)))
   ([events tick-ms start-time]
      (map #(assoc % :at
                   (+ start-time (* tick-ms (:tick %))))
@@ -406,10 +411,10 @@
   (int (/ 60000 (* 96 bpm)))) ;;96 ticks per beat
   
 (defn play-track-events-in-bg
-  "Plays a set of events (uses track->events)"
+  "Plays the events in a track"
   [player track {:keys [bpm]}]
   (let [events (map play-note-later-event
-                    (convert-ticks-to-ms (track->events track) (bpm->ticks-per-ms bpm)))]
+                    (convert-ticks-to-at track (bpm->ticks-per-ms bpm)))]
     (update-in player [:event-queue] concat events)))
 
 (defn play-parsed-midi
@@ -468,13 +473,36 @@
   (swap! player open-player)
   (add-player-event-thread! player))
 
+(defn play-chain!
+  [player-atom chain bpm n]
+  (let [ticks-per-ms (bpm->ticks-per-ms bpm)]
+    (loop [key (rand-nth (keys (:keys chain)))
+           duration (rand-nth (keys (:durations chain)))
+           vel (rand-nth (keys (:velocities chain)))
+           num 0]
+      (when (< num n)
+        (let [duration-ms (* ticks-per-ms duration)]
+          (swap! player play-note (gen-note-info 0 key vel duration-ms))
+          (Thread/sleep duration-ms)
+          (recur
+           (weighted-rand ((:keys chain) key))
+           (weighted-rand ((:durations chain) duration))
+           (weighted-rand ((:velocities chain) vel))
+           (inc num)))))))
+
 (comment
 
   (def tmp (parse-midi "midi/fur_elise.mid"))
+  (def chains (map events->chain) (:tracks tmp))
   
-  (def player (atom (new-player)))
-  (swap! player open-player)
-  (add-player-event-thread! player)
+  (def player (atom nil))
+  (swap! player restart-a-player)
+  
+  ;;play 20 notes at 250 bpm based on the second track
+  (play-chain! player (nth chains 1) 250 20)
+  ;;or
+  (deref (future (play-chain! player (nth chains 1) 200 30)) 1 nil)
+
   (swap! player play-parsed-midi tmp 200)
 
   (swap! player play-note {:key 60 :duration 1000 :channel 0 :vel 90})
