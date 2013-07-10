@@ -179,6 +179,67 @@
                    events
                    started)))))))
 
+(defn inc-or-one
+  [x]
+  (if x
+    (inc x)
+    1))
+
+(defn freqs->probabilities
+  "Updates a frequencies map to a map of value->probability
+   based on total"
+  [freqs]
+  (let [total (reduce + (vals freqs))]
+    (reduce merge
+            (map #(apply hash-map %)
+                 (map (fn [[k v]]
+                        [k (/ v (double total))])
+                      freqs)))))
+(defn freq-map-convert
+  "Updates a list of {<val1> => {<val2> => <freq> ...} ...}
+   to {<val1> => {<val2> => <probability> ...} ...}"
+  [m total]
+  (zipmap (keys m)
+          (map freqs->probabilities
+               (vals m))))
+
+(defn events->chain
+  "Generate a probability chain for each note in the list of events
+   for the following note/velocity/duration"
+  [events]
+  (let [event-count (count events)]
+    (loop [events (sort-by :tick events)
+           keys {}
+           velocities {}
+           durations {}]
+      (if (<= (count events) 1)
+        {:total event-count
+         :keys (freq-map-convert keys event-count)
+         :velocities (freq-map-convert velocities event-count)
+         :durations (freq-map-convert durations event-count)}
+        (let [cur-evt (first events)
+              next-evt (second events)]
+          (recur (rest events)
+                 (update-in keys [(:key cur-evt) (:key next-evt)] inc-or-one)
+                 (update-in velocities [(:vel cur-evt) (:vel next-evt)] inc-or-one)
+                 (update-in durations [(:duration cur-evt) (:duration next-evt)] inc-or-one)))))))
+
+(defn weighted-rand
+  "Returns a random key from weights using the values
+   as the probability of a particular key being returned"
+  [weights]
+  (let [rnum (rand)]
+    (loop [ks (keys weights)
+           vs (vals weights)
+           acc 0.0]
+      (if (< rnum (+ acc (first vs)))
+        (first ks)
+        (recur
+         (rest ks)
+         (rest vs)
+         (+ acc (first vs)))))))
+  
+
 ;;----------PLAYBACK------------
   
 (let [stop-sequencer (fn stop-sequencer
